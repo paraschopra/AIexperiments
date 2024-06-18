@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from dataclasses import dataclass
+import time
 
 # -------------------
 
@@ -242,13 +243,17 @@ model.to(device)
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(i, loss.item())
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1-t0)*1000 # time difference in milliseconds
+    print(i, loss.item(), dt, "ms")
 
 print(logits.shape)
 print(loss)
