@@ -40,10 +40,12 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
                 
-            attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            attn = F.softmax(attn, dim=-1)
-            y = attn @ v
+            #attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            #attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            #attn = F.softmax(attn, dim=-1)
+            #y = attn @ v
+
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
     
             y = y.transpose(1, 2).contiguous().view(B, T, C)
             y = self.c_proj(y)
@@ -230,13 +232,16 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 
 print("using device:", device)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=8, T=1024)
+
+torch.set_float32_matmul_precision("high")
 
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) #because 50304 is power of 2
 model.eval()
 model.to(device)
+model = torch.compile(model)
 
 #logits, loss = model(x, y)
 
@@ -247,17 +252,20 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+        #import code; code.interact(local=locals())
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0)*1000 # time difference in milliseconds
-    print(i, loss.item(), dt, "ms")
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 print(logits.shape)
 print(loss)
-#import sys; sys.exit(0)
+import sys; sys.exit(0)
 
 num_return_sequences = 3
 max_length = 30
