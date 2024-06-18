@@ -1,5 +1,11 @@
 # following this tutorial https://www.youtube.com/watch?v=l8pRSuU81PU&t=2s
 
+# distributed training, run
+# torchrun --standalone --nproc_per_node=2 train_gpt2.py 
+
+# to see nvidia usage
+# watch -n 0.1 nvidia-smi
+
 import math
 import torch
 import torch.nn as nn
@@ -193,9 +199,11 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank=0, num_processes=1):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them in memory
         with open('tinyshakespear.txt', 'r') as f:
@@ -207,7 +215,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -215,103 +223,148 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T *self.num_processes+ 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
     
+from torch.distributed import init_process_group, destroy_process_group
+import os
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-device = "cpu"
+# setup DDP (distributed data paralle)
+# torchrun command sets the env variables RANK, LOCAL_RANK, WORLD_SIZE
+
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "for now i think we need CUDA for ddp"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+    auto_cast_device = "cuda"
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    
+    auto_cast_device =device
+
+    print("using device:", device)
+
+torch.manual_seed(1337)
 if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
+    torch.cuda.manual_seed(1337)
 
 #device = "cpu"
 
-print("using device:", device)
-
-train_loader = DataLoaderLite(B=8, T=1024)
+train_loader = DataLoaderLite(B=8, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 torch.set_float32_matmul_precision("high")
 
 
-# get logits
+# create model
 model = GPT(GPTConfig(vocab_size=50304)) #because 50304 is power of 2
 model.eval()
 model.to(device)
 model = torch.compile(model)
 
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
 #logits, loss = model(x, y)
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for i in range(500):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    loss_accum = 0.0
+    with torch.autocast(device_type=auto_cast_device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
         #import code; code.interact(local=locals())
+    loss_accum += loss.detach()
     loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0)*1000 # time difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
-
-print(logits.shape)
-print(loss)
-import sys; sys.exit(0)
-
-num_return_sequences = 3
-max_length = 30
+    tokens_per_sec = (train_loader.B * train_loader.T * ddp_world_size) / (t1-t0)
+    if master_process:
+        print(f"step {i} | loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello,")
-tokens = torch.tensor(tokens, dtype=torch.long) #(8,) 8 tokens
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5,8)
-x = tokens.to(device)
+#import sys; sys.exit(0)
 
-# generate x is (B,T) where B = 5, T=8
+if master_process:
 
-torch.manual_seed(42)
-torch.mps.manual_seed(42)
+    num_return_sequences = 3
+    max_length = 30
 
-while x.size(1) < max_length:
-    
-    with torch.no_grad():
 
-        logits, _ = model(x)
-        logits = logits[:,-1,:]
-        probs = F.softmax(logits, dim=-1)
 
-        # do top-k sampling of 50 (HF pipeliine default)
-        #topk_probs becomes (5,50)
+    import tiktoken
+    enc = tiktoken.get_encoding('gpt2')
+    tokens = enc.encode("Hello,")
+    tokens = torch.tensor(tokens, dtype=torch.long) #(8,) 8 tokens
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5,8)
+    x = tokens.to(device)
 
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    # generate x is (B,T) where B = 5, T=8
 
-        # select a token from top-k distribution
+    torch.manual_seed(42)
+    torch.mps.manual_seed(42)
 
-        ix = torch.multinomial(topk_probs, num_samples=1)
-
-        # gather the corresponding indicies
-        xcol = torch.gather(topk_indices, -1, ix)
-
-        # append to the sequence
-        x  = torch.cat((x, xcol), dim=-1)
-
+    while x.size(1) < max_length:
         
+        with torch.no_grad():
+
+            logits, _ = model(x)
+            logits = logits[:,-1,:]
+            probs = F.softmax(logits, dim=-1)
+
+            # do top-k sampling of 50 (HF pipeliine default)
+            #topk_probs becomes (5,50)
+
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+
+            # select a token from top-k distribution
+
+            ix = torch.multinomial(topk_probs, num_samples=1)
+
+            # gather the corresponding indicies
+            xcol = torch.gather(topk_indices, -1, ix)
+
+            # append to the sequence
+            x  = torch.cat((x, xcol), dim=-1)
+
+            
 
 
-# decode the tokens
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+    # decode the tokens
+    for i in range(num_return_sequences):
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)
+
+if ddp:
+    destroy_process_group()
