@@ -324,7 +324,7 @@ if cuda_available:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-#raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 #logits, loss = model(x, y)
 
@@ -350,7 +350,7 @@ def get_lr(it):
 
 print("using device:", device)
 print("using auto cast device:", auto_cast_device)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
